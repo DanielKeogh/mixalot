@@ -1,4 +1,4 @@
-;;;; Mixalot audio mixer for ALSA
+;;;; Mixalot audio mixer for OpenAL
 
 ;;;; Copyright (c) 2009,2010 Andy Hefner
 
@@ -24,10 +24,7 @@
 
 (defpackage :mixalot
   (:use :common-lisp :cffi :bordeaux-threads :mixalot-ffi-common)
-  (:export #:alsa-error
-           #:main-thread-init
-
-           #:sample-vector
+  (:export #:sample-vector
            #:stereo-sample
            #:mono-sample
 
@@ -91,10 +88,6 @@
 
 (in-package :mixalot)
 
-(eval-when (:compile-toplevel)
-  #-linux (pushnew 'use-ao *features*)
-  #+linux (pushnew 'use-alsa *features*))
-
 (deftype array-index ()
   #-sbcl '(integer 0 #.array-dimension-limit)
   #+sbcl 'sb-int:index)
@@ -107,219 +100,6 @@
     (unsigned-byte 16)))
 
 (deftype sample-vector () '(simple-array stereo-sample 1))
-
-;;;; FFI to minimal subset of ALSA library
-
-#+mixalot::use-alsa
-(define-foreign-library libasound
-    (t (:or "libasound.so.2" "libasound.so"
-            "/usr/lib/libasound.so"
-            "/usr/local/lib/libasound.so")))
-
-#+mixalot::use-alsa
-(use-foreign-library libasound)
-
-#+mixalot::use-alsa
-(define-condition alsa-error (error)
-  ((text :initarg :text))
-  (:documentation "An error from the ALSA library")
-  (:report
-   (lambda (condition stream)
-     (write-string (slot-value condition 'text) stream))))
-
-#+mixalot::use-alsa
-(defcfun snd-strerror :string (errnum :int))
-
-#+mixalot::use-alsa
-(defun check-error (circumstance result)
-  (unless (zerop result)
-    (error 'alsa-error
-           :text (format nil "~A: ~A" circumstance (snd-strerror result)))))
-
-#+mixalot::use-alsa
-(defctype snd-pcm :pointer)
-
-#+mixalot::use-alsa
-(defcenum snd-pcm-stream
-    (:playback 0)
-    (:capture 1))
-
-#+mixalot::use-alsa
-(defcenum snd-pcm-mode
-    (:blocking 0)
-    (:nonblocking 1)
-    (:async 2))
-
-#+mixalot::use-alsa
-(defcfun (%snd-pcm-open "snd_pcm_open") :int
-  (pcm (:pointer snd-pcm))
-  (name :string)
-  (type snd-pcm-stream)
-  (mode snd-pcm-mode))
-
-#+mixalot::use-alsa
-(defun snd-pcm-open (name stream-type mode)
-  (with-foreign-object (pcm 'snd-pcm)
-    (check-error
-     (format nil "PCM open of ~W (~A,~A)" name stream-type mode)
-     (%snd-pcm-open pcm name stream-type mode))
-    (validate-pointer (mem-ref pcm 'snd-pcm))))
-
-#+mixalot::use-alsa
-(defcfun snd-pcm-close :int
-  (pcm snd-pcm))
-
-#+mixalot::use-alsa
-(defcenum snd-pcm-format
-  (:snd-pcm-format-s16-le 2))
-
-#+mixalot::use-alsa
-(defcenum snd-pcm-access
-    (:snd-pcm-access-rw-interleaved 3)
-    (:snd-pcm-access-rw-noninterleaved 4))
-
-#+mixalot::use-alsa
-(defcfun snd-pcm-set-params :int
-  (pcm           snd-pcm)
-  (format        snd-pcm-format)
-  (access        snd-pcm-access)
-  (channels      :unsigned-int)
-  (rate          :unsigned-int)
-  (soft-resample :int)
-  (latency       :unsigned-int))
-
-#+mixalot::use-alsa
-(defcfun snd-pcm-recover :int
-  (pcm    snd-pcm)
-  (err    :int)
-  (silent :int))
-
-#+mixalot::use-alsa (defctype snd-pcm-sframes :long)
-#+mixalot::use-alsa (defctype snd-pcm-uframes :unsigned-long)
-
-#+mixalot::use-alsa
-(defcfun snd-pcm-writei snd-pcm-sframes
-  (pcm    snd-pcm)
-  (buffer :pointer)
-  (size   snd-pcm-uframes))
-
-#+mixalot::use-alsa (defctype snd-output :pointer)
-
-#+mixalot::use-alsa
-(defcfun snd-output-stdio-attach :int
-  (outputp (:pointer snd-output))
-  (file    :pointer)
-  (close   :int))
-
-#+mixalot::use-alsa
-(defcfun snd-pcm-dump :int
-  (pcm snd-pcm)
-  (out snd-output))
-
-#+mixalot::use-alsa
-(defun main-thread-init ()
-  ;; libao needs this. ALSA does not, which is the only good thing I can say about it.
-  (values))
-
-;;;; ALSA Utilities
-
-#+mixalot::use-alsa (defcvar stdout :pointer)
-
-#+mixalot::use-alsa
-(defun dump-pcm-info (pcm)
-  (with-foreign-object (output :pointer)
-    (check-error
-     "Attach output"
-     (snd-output-stdio-attach output stdout 0))
-    (check-error
-     "PCM diagnostic state dump"
-     (snd-pcm-dump pcm (mem-ref output :pointer)))))
-
-#+mixalot::use-alsa
-(defun call-with-pcm (rate continuation)
-  (let ((pcm (snd-pcm-open "default" :playback :blocking)))
-    (unwind-protect
-         (progn
-           (check-error
-            "PCM set parameters"
-            (snd-pcm-set-params
-             pcm :snd-pcm-format-s16-le :snd-pcm-access-rw-interleaved
-             2 rate 1 300000))
-           (funcall continuation pcm))
-      (snd-pcm-close pcm))))
-
-;;;; Alternate interface using libao. Tested on OS X, FreeBSD.
-
-;;; This isn't ideal. You're forced to initialize the audio system
-;;; (and thus the mixer) from the "main thread", due to OS X being a
-;;; half-assed joke.
-
-;;; In theory this could work in Win32 as well. I haven't tried it.
-
-#+mixalot::use-ao
-(define-foreign-library libao
-  (:darwin (:or "libao.4.dylib" "/opt/local/lib/libao.4.dylib"))
-  (t (:or "libao.so")))
-
-#+mixalot::use-ao (use-foreign-library libao)
-
-;; Danger! This must be called from the main thread! Stupid OS X.
-#+mixalot::use-ao
-(defcfun ao-initialize :void)
-
-#+mixalot::use-ao
-(defcfun ao-default-driver-id :int)
-
-#+mixalot::use-ao
-(defcstruct (ao-sample-format :conc-name ao-fmt-)
-  (bits :int)
-  (rate :int)
-  (channels :int)
-  (byte-format :int)
-  (matrix :string))
-
-#+mixalot::use-ao (defconstant AO_FMT_LITTLE 1)
-#+mixalot::use-ao (defconstant AO_FMT_BIG    2)
-#+mixalot::use-ao (defconstant AO_FMT_NATIVE 4)
-
-#+mixalot::use-ao (defctype ao-device* :pointer)
-
-#+mixalot::use-ao
-(defcfun ao-open-live ao-device*
-  (driver-id :int)
-  (format (:pointer ao-sample-format))
-  (options :pointer))
-
-#+mixalot::use-ao (defvar *ao-main-thread-init* nil)
-#+mixalot::use-ao (defvar *aodev* nil)
-
-#+mixalot::use-ao
-(defun open-ao (&key (rate 44100))
-  (unless *ao-main-thread-init*
-    (error "libao not initialized. You must call MIXALOT:MAIN-THREAD-INIT from the main thread of your lisp. In SBCL, this will be the initial REPL (the *inferior-lisp* buffer in SLIME). If you call it from another thread, Lisp may crash."))
-  (with-foreign-object (fmt 'ao-sample-format)
-    (with-foreign-string (matrix "L,R")
-     (setf (ao-fmt-bits fmt) 16
-           (ao-fmt-channels fmt) 2
-           (ao-fmt-rate fmt) rate
-           (ao-fmt-byte-format fmt) AO_FMT_LITTLE
-           (ao-fmt-matrix fmt) matrix)
-    (ao-open-live (ao-default-driver-id)
-                   fmt
-                   (null-pointer)))))
-
-#+mixalot::use-ao
-(defun main-thread-init ()
-  (unless *ao-main-thread-init*
-    (setf *ao-main-thread-init* t)
-    (ao-initialize)))
-
-#+mixalot::use-ao
-(defcfun ao-play :int
-  (device ao-device*)
-  (output-samples :pointer)
-  (num-bytes :uint32))
-
 
 ;;;; Basic stream protocol
 
@@ -510,7 +290,8 @@
   (loop for removed across temp-vector
         do (streamer-cleanup removed mixer)))
 
-(defconstant +mixer-buffer-size+ 4096)
+;(defconstant +mixer-buffer-size+ 4096)
+(defconstant +mixer-buffer-size+ 1024)
 (deftype mixer-buffer-index () `(integer 0 ,+mixer-buffer-size+))
 
 (define-condition playback-finished ()
@@ -526,106 +307,129 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
   (:method (mixer buffer offset size)
     (declare (ignore mixer buffer offset size))))
 
+(defun playing-p (source)
+  (cffi-c-ref:c-with ((playing %al:int))
+    (%al:get-sourcei source %al:+source-state+ (playing &))
+    (= playing %al:+playing+)))
+
+(defun wait-for-buffer (source)
+  (cffi-c-ref:c-with ((buffers-queued %al:int)
+		      (buffers-processed %al:int))
+    (%al:get-sourcei source %al:+buffers-queued+ (buffers-queued &))
+    (%al:get-sourcei source %al:+buffers-processed+ (buffers-processed &))
+    (loop while (and (> buffers-queued 2) (< buffers-processed 1))
+	  for i from 0 to 1000
+	  do
+	     (sleep 0.01)
+	     (%al:get-sourcei source %al:+buffers-processed+ (buffers-processed &)))))
+
+(defun dequeue-buffer (source)
+  (cffi-c-ref:c-with ((buffers-processed %al:int))
+    (%al:get-sourcei source %al:+buffers-processed+ (buffers-processed &))
+    (when (> buffers-processed 0)
+      (static-vectors:with-static-vector (o buffers-processed)
+	(%al:source-unqueue-buffers source buffers-processed (static-vectors:static-vector-pointer o))))))
+
+
+(defmacro with-sound (&body body)
+  `(float-features:with-float-traps-masked ()
+     ;; Open default sound device
+     (let ((dev (%alc:open-device nil)))
+       (when (cffi:null-pointer-p dev)
+         (error "Couldn't open sound device"))
+       ;; Create OpenAL context for opened device
+       (unwind-protect
+	    (let ((ctx (%alc:create-context dev nil)))
+	      (when (cffi:null-pointer-p ctx)
+		(error "Failed to create OpenAL context"))
+	      ;; Assign OpenAL context to the application
+	      (%alc:make-context-current ctx)
+	      (unwind-protect
+		   (progn ,@body)
+		   (%alc:destroy-context ctx)))
+	 (%alc:close-device dev)))))
+
+
 (defun run-mixer-process (mixer)
- (declare (optimize (speed 3)))
- (unwind-protect
-  ;; Body
-  (loop with time = 0
-        with buffer-samples = +mixer-buffer-size+
-        with buffer = (make-array buffer-samples :element-type '(unsigned-byte 32))
-        with playable-streams = (make-array 0 :adjustable t :fill-pointer 0)
-        with buffer-clear = nil
-        until (mixer-shutdown-flag mixer)
-        do
-        ;; So that we don't have to hold the lock during the stream
-        ;; callbacks, use this temporary vector:
-        (remove-removable mixer playable-streams)
-        (update-playable mixer playable-streams)
-        ;; Loop through playable streams and generate audio
-        (loop for streamer across playable-streams
-              for first = t then nil
-              as offset = 0             ; ...
-              do
-              (setf buffer-clear nil)
-              (restart-case
-                  (handler-case
-                      (funcall (if first
-                                   #'streamer-write-into
-                                   #'streamer-mix-into)
-                               streamer
-                               mixer
-                               buffer
-                               offset
-                               (- buffer-samples offset)
-                               (+ time offset))
-                    (playback-finished () (mixer-remove-streamer mixer streamer)))
-                (remove-streamer ()
-                  :report "Delete this audio stream"
-                  (mixer-remove-streamer mixer streamer))))
-        ;; If there are no playable streams, we have to clear the buffer ourself.
-        (when (and (zerop (length playable-streams))
-                   (not buffer-clear))
-          (fill buffer 0)
-          (setf buffer-clear t))
-        ;; Notification of data written.
-        (mixer-note-write mixer buffer 0 buffer-samples)
+  (declare (optimize (speed 3)))
+  (with-sound
+    (cffi-c-ref:c-with ((source %al:uint))
+      (cffi:with-foreign-array (all-buffers (make-array 3) '(:array %al:uint 3))
+	(static-vectors:with-static-vectors ((buffer +mixer-buffer-size+ :element-type '(unsigned-byte 32)))
+	  (%al:gen-buffers 3 all-buffers)
+	  (%al:gen-sources 1 (source &))
+	  (unwind-protect
+	       (loop with current-buffer fixnum = 0
+		     with time fixnum = 0
+		     with buffer-samples = +mixer-buffer-size+
 
-        ;; Play the buffer.
-        #+mixalot::use-ao
-        (let ((ret
-               (with-array-pointer (ptr buffer)
-                 (ao-play (mixer-device mixer) ptr (* 4 buffer-samples)))))
-          (when (zerop ret)
-            (format *trace-output* "libao error.")))
+		     with playable-streams = (make-array 0 :adjustable t :fill-pointer 0)
+		     with buffer-clear = nil
+		     with rate = (mixer-rate mixer)
+		     until (mixer-shutdown-flag mixer)
+		     do
+			;; So that we don't have to hold the lock during the stream
+			;; callbacks, use this temporary vector:
+			(remove-removable mixer playable-streams)
+			(update-playable mixer playable-streams)
+			;; Loop through playable streams and generate audio
+			(loop for streamer across playable-streams
+			      for first = t then nil
+			      as offset = 0             ; ...
+			      do
+				 (setf buffer-clear nil)
+				 (restart-case
+				     (handler-case
+					 (funcall (if first
+						      #'streamer-write-into
+						      #'streamer-mix-into)
+						  streamer
+						  mixer
+						  buffer
+						  offset
+						  (- buffer-samples offset)
+						  (+ time offset))
+				       (playback-finished () (mixer-remove-streamer mixer streamer)))
+				   (remove-streamer ()
+				     :report "Delete this audio stream"
+				     (mixer-remove-streamer mixer streamer))))
+			;; If there are no playable streams, we have to clear the buffer ourself.
+			(when (and (zerop (length playable-streams))
+				   (not buffer-clear))
+			  (fill buffer 0)
+			  (setf buffer-clear t))
+			;; Notification of data written.
+			(mixer-note-write mixer buffer 0 buffer-samples)
 
-        #+mixalot::use-alsa
-        (loop with offset of-type mixer-buffer-index = 0
-              as nwrite = (- buffer-samples offset)
-              as nframes = (with-array-pointer (ptr buffer)
-                             (incf-pointer ptr (* offset 4))
-                             (snd-pcm-writei (mixer-device mixer) ptr nwrite))
-              do
-              (unless (zerop offset)
-                (format t "~&mixer time ~A partial offset ~:D~%"
-                        (mixer-current-time mixer)
-                        offset))
-              (assert (integerp nframes))
-              (cond
-                ((< nframes 0)
-                 (format *trace-output* "~&nframes<0, snd-pcm-recover")
-                 (snd-pcm-recover (mixer-device mixer) nframes 1))
-                ((< nframes nwrite)
-                 (format *trace-output* "~&short write ~D vs ~D (offset ~D)~%"
-                         nframes (- buffer-samples offset) offset)
-                 (incf offset nframes))
-                (t (loop-finish))))
+			;; Play the buffer.
+			(dequeue-buffer source)
+			(%al:buffer-data (cffi:foreign-aref all-buffers '(:array %al:uint 3) current-buffer)
 
-        (incf time buffer-samples)
-        (setf (mixer-current-time mixer) time))
-   ;; Cleanup. After setting the shutdown flag, it is impossible to
-   ;; add additional streamers, so there's no race during the shutdown.
-   (with-mixer-lock (mixer) (setf (mixer-shutdown-flag mixer) t))
-   (dolist (streamer (mixer-stream-list mixer))
-     (streamer-cleanup streamer mixer))
-   (clrhash (mixer-stream-state mixer))
-   (setf (mixer-stream-list mixer) nil)))
+					 %al:+format-stereo16+ (static-vectors:static-vector-pointer buffer)
+					 (* 4 +mixer-buffer-size+) rate)
+			
+			(%al:source-queue-buffers source 1 (cffi:inc-pointer all-buffers (* current-buffer 4)))
+			(setf current-buffer (mod (1+ current-buffer) 3))
+			(unless (playing-p source)
+			  (print "start playing source")
+			  (%al:source-play source))
+			(wait-for-buffer source)
+			(incf time buffer-samples)
+			(setf (mixer-current-time mixer) time))
+	    ;; Cleanup. After setting the shutdown flag, it is impossible to
+	    ;; add additional streamers, so there's no race during the shutdown.
+	    (with-mixer-lock (mixer) (setf (mixer-shutdown-flag mixer) t))
+	    (dolist (streamer (mixer-stream-list mixer))
+	      (streamer-cleanup streamer mixer))
+	    (clrhash (mixer-stream-state mixer))
+	    (setf (mixer-stream-list mixer) nil)))))))
 
 (defun create-mixer (&key (rate 44100) (constructor 'make-mixer))
   "Create a new mixer at the specified sample rate, running in its own thread."
-  #-(or mixalot::use-ao mixalot::use-alsa)
-  (error "Neither mixalot::use-ao nor mixalot::use-alsa existed on *features* when this function was compiled. That is wrong.")
   (let ((mixer (funcall constructor :rate rate)))
     (bordeaux-threads:make-thread
      (lambda ()
-       #+mixalot::use-ao
-       (progn
-         (setf (mixer-device mixer) (open-ao :rate rate))
-         (run-mixer-process mixer))
-       #+mixalot::use-alsa
-       (call-with-pcm rate
-        (lambda (pcm)
-          (setf (mixer-device mixer) pcm)
-          (run-mixer-process mixer))))
+       (run-mixer-process mixer))
      :name (format nil "Mixer thread ~:D Hz" rate))
     mixer))
 
@@ -649,6 +453,12 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
            (type mono-sample left right))
   (logior (ldb (byte 16 0) left)
           (ash (ldb (byte 16 0) right) 16)))
+
+(defun stereo-sample16 (left right)
+  (declare (optimize (speed 3))
+           (type mono-sample left right))
+  (logior (ldb (byte 8 0) left)
+          (ash (ldb (byte 8 0) right) 8)))
 
 (defun mono->stereo (sample)
   (stereo-sample sample sample))
