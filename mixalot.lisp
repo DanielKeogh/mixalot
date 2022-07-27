@@ -290,8 +290,8 @@
   (loop for removed across temp-vector
         do (streamer-cleanup removed mixer)))
 
-;(defconstant +mixer-buffer-size+ 4096)
 (defconstant +mixer-buffer-size+ 1024)
+(defconstant +ring-buffer-count+ 3)
 (deftype mixer-buffer-index () `(integer 0 ,+mixer-buffer-size+))
 
 (define-condition playback-finished ()
@@ -317,8 +317,8 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
 		      (buffers-processed %al:int))
     (%al:get-sourcei source %al:+buffers-queued+ (buffers-queued &))
     (%al:get-sourcei source %al:+buffers-processed+ (buffers-processed &))
-    (loop while (and (> buffers-queued 2) (< buffers-processed 1))
-	  for i from 0 to 1000
+    (loop while (and (>= buffers-queued +ring-buffer-count+) (< buffers-processed 1))
+	  for i from 0 to 50
 	  do
 	     (sleep 0.01)
 	     (%al:get-sourcei source %al:+buffers-processed+ (buffers-processed &)))))
@@ -330,8 +330,7 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
       (static-vectors:with-static-vector (o buffers-processed)
 	(%al:source-unqueue-buffers source buffers-processed (static-vectors:static-vector-pointer o))))))
 
-
-(defmacro with-sound (&body body)
+(defmacro with-al-device (&body body)
   `(float-features:with-float-traps-masked ()
      ;; Open default sound device
      (let ((dev (%alc:open-device nil)))
@@ -349,17 +348,17 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
 		   (%alc:destroy-context ctx)))
 	 (%alc:close-device dev)))))
 
-
 (defun run-mixer-process (mixer)
   (declare (optimize (speed 3)))
-  (with-sound
+  (with-al-device
     (cffi-c-ref:c-with ((source %al:uint))
-      (cffi:with-foreign-array (all-buffers (make-array 3) '(:array %al:uint 3))
+      (cffi:with-foreign-array (buffer-ring (make-array +ring-buffer-count+)
+					    '(:array %al:uint +ring-buffer-count+))
 	(static-vectors:with-static-vectors ((buffer +mixer-buffer-size+ :element-type '(unsigned-byte 32)))
-	  (%al:gen-buffers 3 all-buffers)
+	  (%al:gen-buffers +ring-buffer-count+ buffer-ring)
 	  (%al:gen-sources 1 (source &))
 	  (unwind-protect
-	       (loop with current-buffer fixnum = 0
+	       (loop with ring-index fixnum = 0
 		     with time fixnum = 0
 		     with buffer-samples = +mixer-buffer-size+
 
@@ -403,15 +402,14 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
 
 			;; Play the buffer.
 			(dequeue-buffer source)
-			(%al:buffer-data (cffi:foreign-aref all-buffers '(:array %al:uint 3) current-buffer)
+			(%al:buffer-data (cffi:foreign-aref buffer-ring '(:array %al:uint +ring-buffer-count+) ring-index)
 
 					 %al:+format-stereo16+ (static-vectors:static-vector-pointer buffer)
 					 (* 4 +mixer-buffer-size+) rate)
 			
-			(%al:source-queue-buffers source 1 (cffi:inc-pointer all-buffers (* current-buffer 4)))
-			(setf current-buffer (mod (1+ current-buffer) 3))
+			(%al:source-queue-buffers source 1 (cffi:inc-pointer buffer-ring (* ring-index 4)))
+			(setf ring-index (mod (1+ ring-index) +ring-buffer-count+))
 			(unless (playing-p source)
-			  (print "start playing source")
 			  (%al:source-play source))
 			(wait-for-buffer source)
 			(incf time buffer-samples)
@@ -453,12 +451,6 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
            (type mono-sample left right))
   (logior (ldb (byte 16 0) left)
           (ash (ldb (byte 16 0) right) 16)))
-
-(defun stereo-sample16 (left right)
-  (declare (optimize (speed 3))
-           (type mono-sample left right))
-  (logior (ldb (byte 8 0) left)
-          (ash (ldb (byte 8 0) right) 8)))
 
 (defun mono->stereo (sample)
   (stereo-sample sample sample))
