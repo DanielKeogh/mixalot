@@ -353,7 +353,7 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
   (with-al-device
     (cffi-c-ref:c-with ((source %al:uint))
       (cffi:with-foreign-array (buffer-ring (make-array +ring-buffer-count+)
-					    '(:array %al:uint +ring-buffer-count+))
+					    `(:array %al:uint ,+ring-buffer-count+))
 	(static-vectors:with-static-vectors ((buffer +mixer-buffer-size+ :element-type '(unsigned-byte 32)))
 	  (%al:gen-buffers +ring-buffer-count+ buffer-ring)
 	  (%al:gen-sources 1 (source &))
@@ -402,7 +402,7 @@ should be output in STREAMER-MIX-INTO or STREAMER-WRITE-INTO."
 
 			;; Play the buffer.
 			(dequeue-buffer source)
-			(%al:buffer-data (cffi:foreign-aref buffer-ring '(:array %al:uint +ring-buffer-count+) ring-index)
+			(%al:buffer-data (cffi:foreign-aref buffer-ring `(:array %al:uint ,+ring-buffer-count+) ring-index)
 
 					 %al:+format-stereo16+ (static-vectors:static-vector-pointer buffer)
 					 (* 4 +mixer-buffer-size+) rate)
